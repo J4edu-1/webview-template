@@ -1,0 +1,504 @@
+package {{PACKAGE_NAME}}
+
+import android.Manifest
+import android.animation.AnimatorSet
+import android.animation.ObjectAnimator
+import android.annotation.SuppressLint
+import android.app.Activity
+import android.app.DownloadManager
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.os.Environment
+import android.os.Handler
+import android.os.Looper
+import android.view.MotionEvent
+import android.view.View
+import android.view.animation.AccelerateDecelerateInterpolator
+import android.view.animation.OvershootInterpolator
+import android.webkit.*
+import android.widget.FrameLayout
+import android.widget.ImageView
+import android.widget.ProgressBar
+import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
+import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
+import androidx.swiperefreshlayout.widget.SwipeRefreshLayout
+
+class MainActivity : AppCompatActivity() {
+
+    // ========== CONFIGURATION (INJECTED BY BUILD SYSTEM) ==========
+    private val appUrl = "{{BASE_URL}}"
+    private val jsEnabled = {{JS_ENABLED}}
+    private val domStorageEnabled = {{DOM_STORAGE}}
+    private val cacheEnabled = {{CACHE_ENABLED}}
+    private val fileUploadEnabled = {{FILE_UPLOAD}}
+    private val fileDownloadEnabled = {{FILE_DOWNLOAD}}
+    private val customUserAgent = "{{CUSTOM_USER_AGENT}}"
+    private val fullscreenMode = {{FULLSCREEN}}
+    private val allowExternalNav = {{EXTERNAL_NAV}}
+    private val pullToRefreshEnabled = {{PULL_TO_REFRESH}}
+    private val loadingBarEnabled = {{LOADING_BAR_ENABLED}}
+    private val loadingBarType = "{{LOADING_BAR_TYPE}}" // top_bar, circular, chrome, none
+    private val httpsOnly = {{HTTPS_ONLY}}
+    private val offlineMode = "{{OFFLINE_MODE}}" // html, toast, redirect
+    // ===============================================================
+
+    private lateinit var webView: WebView
+    private lateinit var swipeRefreshLayout: SwipeRefreshLayout
+    private lateinit var splashOverlay: FrameLayout
+    private lateinit var splashLogo: ImageView
+    private var progressBar: ProgressBar? = null
+
+    private var fileUploadCallback: ValueCallback<Array<Uri>>? = null
+    private var touchingInnerScrollable = false
+    private var lastTouchX = 0f
+    private var lastTouchY = 0f
+
+    // Camera permission request
+    private val cameraPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        if (isGranted) {
+            pendingPermissionRequest?.grant(pendingPermissionRequest!!.resources)
+        } else {
+            pendingPermissionRequest?.deny()
+        }
+        pendingPermissionRequest = null
+    }
+
+    private var pendingPermissionRequest: PermissionRequest? = null
+
+    // File chooser for upload
+    private val fileChooserLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            val data = result.data
+            val results = if (data?.clipData != null) {
+                val count = data.clipData!!.itemCount
+                Array(count) { i -> data.clipData!!.getItemAt(i).uri }
+            } else if (data?.data != null) {
+                arrayOf(data.data!!)
+            } else {
+                null
+            }
+            fileUploadCallback?.onReceiveValue(results)
+        } else {
+            fileUploadCallback?.onReceiveValue(null)
+        }
+        fileUploadCallback = null
+    }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        val splashScreen = installSplashScreen()
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+
+        var keepSplash = true
+        splashScreen.setKeepOnScreenCondition { keepSplash }
+
+        // Initialize views
+        webView = findViewById(R.id.webView)
+        swipeRefreshLayout = findViewById(R.id.swipeRefreshLayout)
+        splashOverlay = findViewById(R.id.splashOverlay)
+        splashLogo = findViewById(R.id.splashLogo)
+        progressBar = findViewById(R.id.progressBar)
+
+        // Setup components based on config
+        if (pullToRefreshEnabled) {
+            setupSwipeRefresh()
+        } else {
+            swipeRefreshLayout.isEnabled = false
+        }
+
+        setupWebView()
+        setupFullscreen()
+
+        Handler(Looper.getMainLooper()).postDelayed({
+            keepSplash = false
+            animateSplashLogo()
+        }, 300)
+
+        // Check connectivity and load
+        if (isNetworkAvailable()) {
+            webView.loadUrl(appUrl)
+        } else {
+            handleOffline()
+        }
+    }
+
+    private fun isNetworkAvailable(): Boolean {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val network = cm.activeNetwork ?: return false
+        val caps = cm.getNetworkCapabilities(network) ?: return false
+        return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+    }
+
+    private fun handleOffline() {
+        when (offlineMode) {
+            "toast" -> {
+                Toast.makeText(this, "No internet connection", Toast.LENGTH_LONG).show()
+                webView.loadUrl("about:blank")
+            }
+            "html" -> {
+                webView.loadData(
+                    """
+                    <html><body style="display:flex;justify-content:center;align-items:center;height:100vh;margin:0;font-family:sans-serif;background:#f5f5f5;">
+                    <div style="text-align:center;padding:20px;">
+                        <h2 style="color:#333;">⚠️ No Internet Connection</h2>
+                        <p style="color:#666;">Please check your connection and try again.</p>
+                        <button onclick="location.reload()" style="padding:12px 24px;background:#1976D2;color:white;border:none;border-radius:8px;font-size:16px;cursor:pointer;">Retry</button>
+                    </div></body></html>
+                    """.trimIndent(),
+                    "text/html", "UTF-8"
+                )
+            }
+            "redirect" -> {
+                webView.loadUrl("file:///android_asset/offline.html")
+            }
+        }
+    }
+
+    private fun setupFullscreen() {
+        if (fullscreenMode) {
+            window.decorView.systemUiVisibility = (
+                View.SYSTEM_UI_FLAG_FULLSCREEN
+                or View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
+                or View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
+            )
+        }
+    }
+
+    @SuppressLint("ClickableViewAccessibility")
+    private fun setupSwipeRefresh() {
+        swipeRefreshLayout.setColorSchemeColors(
+            ContextCompat.getColor(this, R.color.primary),
+            ContextCompat.getColor(this, R.color.accent),
+            ContextCompat.getColor(this, R.color.primary_dark)
+        )
+
+        swipeRefreshLayout.setOnRefreshListener {
+            webView.reload()
+        }
+
+        webView.setOnTouchListener { _, event ->
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    lastTouchX = event.x
+                    lastTouchY = event.y
+                    checkInnerScrollable(event.x, event.y)
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    touchingInnerScrollable = false
+                }
+            }
+            false
+        }
+
+        webView.setOnScrollChangeListener { _, _, scrollY, _, _ ->
+            swipeRefreshLayout.isEnabled = scrollY == 0 && !touchingInnerScrollable
+        }
+
+        swipeRefreshLayout.setOnChildScrollUpCallback { _, _ ->
+            webView.scrollY > 0 || touchingInnerScrollable
+        }
+    }
+
+    private fun checkInnerScrollable(x: Float, y: Float) {
+        val jsX = (x / resources.displayMetrics.density).toInt()
+        val jsY = (y / resources.displayMetrics.density).toInt()
+
+        val js = """
+            (function() {
+                var el = document.elementFromPoint($jsX, $jsY);
+                if (!el) return false;
+                while (el && el !== document.body && el !== document.documentElement) {
+                    var style = window.getComputedStyle(el);
+                    var overflowY = style.overflowY;
+                    var overflowX = style.overflowX;
+                    var position = style.position;
+                    var isScrollable = (overflowY === 'auto' || overflowY === 'scroll' ||
+                                        overflowX === 'auto' || overflowX === 'scroll');
+                    var isOverlay = (position === 'fixed' || position === 'absolute');
+                    var classList = el.className || '';
+                    var role = el.getAttribute('role') || '';
+                    var isUIElement = /sidebar|drawer|modal|dialog|overlay|panel|menu|popup|sheet|nav/i.test(classList) ||
+                                      /sidebar|drawer|modal|dialog|overlay|panel|menu|popup|sheet|nav/i.test(el.id || '') ||
+                                      /dialog|menu|navigation|complementary/i.test(role);
+                    if (isScrollable || (isOverlay && el.scrollHeight > el.clientHeight) || isUIElement) {
+                        return true;
+                    }
+                    el = el.parentElement;
+                }
+                return false;
+            })()
+        """.trimIndent()
+
+        webView.evaluateJavascript(js) { result ->
+            touchingInnerScrollable = result == "true"
+            swipeRefreshLayout.isEnabled = webView.scrollY == 0 && !touchingInnerScrollable
+        }
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun setupWebView() {
+        val settings = webView.settings
+
+        settings.javaScriptEnabled = jsEnabled
+        settings.domStorageEnabled = domStorageEnabled
+        settings.databaseEnabled = true
+        settings.allowFileAccess = true
+        settings.allowContentAccess = true
+        settings.mixedContentMode = if (httpsOnly) {
+            WebSettings.MIXED_CONTENT_NEVER_ALLOW
+        } else {
+            WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+        }
+        settings.cacheMode = if (cacheEnabled) WebSettings.LOAD_DEFAULT else WebSettings.LOAD_NO_CACHE
+        settings.setSupportZoom(true)
+        settings.builtInZoomControls = true
+        settings.displayZoomControls = false
+        settings.useWideViewPort = true
+        settings.loadWithOverviewMode = true
+        settings.mediaPlaybackRequiresUserGesture = false
+
+        // Custom User Agent
+        if (customUserAgent.isNotEmpty() && customUserAgent != "default") {
+            settings.userAgentString = customUserAgent
+        } else {
+            // Remove WebView detection tokens for compatibility
+            val defaultUA = settings.userAgentString
+            settings.userAgentString = defaultUA
+                .replace("; wv", "")
+                .replace("Version/[\\d.]+".toRegex(), "")
+        }
+
+        // Cookies
+        CookieManager.getInstance().apply {
+            setAcceptCookie(true)
+            setAcceptThirdPartyCookies(webView, true)
+        }
+
+        // WebViewClient
+        webView.webViewClient = object : WebViewClient() {
+            override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
+                super.onPageStarted(view, url, favicon)
+                if (loadingBarEnabled) progressBar?.visibility = View.VISIBLE
+            }
+
+            override fun onPageFinished(view: WebView?, url: String?) {
+                super.onPageFinished(view, url)
+                swipeRefreshLayout.isRefreshing = false
+                if (loadingBarEnabled) progressBar?.visibility = View.GONE
+            }
+
+            override fun shouldOverrideUrlLoading(
+                view: WebView?,
+                request: WebResourceRequest?
+            ): Boolean {
+                val url = request?.url?.toString() ?: return false
+
+                // HTTPS enforcement
+                if (httpsOnly && !url.startsWith("https://")) {
+                    return true // Block non-HTTPS
+                }
+
+                if (!allowExternalNav) {
+                    // Keep everything internal
+                    return false
+                }
+
+                // Check if URL belongs to the app domain
+                val appHost = Uri.parse(appUrl).host
+                val linkHost = Uri.parse(url).host
+                if (appHost != null && linkHost != null && linkHost.contains(appHost)) {
+                    return false // Same domain, keep in WebView
+                }
+
+                // Google Auth flows stay internal
+                if (url.contains("accounts.google.com") ||
+                    url.contains("googleapis.com") ||
+                    url.contains("google.com/o/oauth")
+                ) {
+                    return false
+                }
+
+                // External links
+                try {
+                    startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+                } catch (e: Exception) {
+                    return false
+                }
+                return true
+            }
+
+            override fun onReceivedError(
+                view: WebView?,
+                request: WebResourceRequest?,
+                error: WebResourceError?
+            ) {
+                super.onReceivedError(view, request, error)
+                if (request?.isForMainFrame == true) {
+                    handleOffline()
+                }
+            }
+        }
+
+        // WebChromeClient
+        webView.webChromeClient = object : WebChromeClient() {
+            override fun onPermissionRequest(request: PermissionRequest?) {
+                request?.let { req ->
+                    val resources = req.resources
+                    if (resources.contains(PermissionRequest.RESOURCE_VIDEO_CAPTURE)) {
+                        if (ContextCompat.checkSelfPermission(
+                                this@MainActivity,
+                                Manifest.permission.CAMERA
+                            ) == PackageManager.PERMISSION_GRANTED
+                        ) {
+                            req.grant(resources)
+                        } else {
+                            pendingPermissionRequest = req
+                            cameraPermissionLauncher.launch(Manifest.permission.CAMERA)
+                        }
+                    } else {
+                        req.grant(resources)
+                    }
+                }
+            }
+
+            override fun onShowFileChooser(
+                webView: WebView?,
+                filePathCallback: ValueCallback<Array<Uri>>?,
+                fileChooserParams: FileChooserParams?
+            ): Boolean {
+                if (!fileUploadEnabled) return false
+
+                fileUploadCallback?.onReceiveValue(null)
+                fileUploadCallback = filePathCallback
+
+                val intent = fileChooserParams?.createIntent() ?: Intent(Intent.ACTION_GET_CONTENT).apply {
+                    addCategory(Intent.CATEGORY_OPENABLE)
+                    type = "*/*"
+                }
+
+                try {
+                    fileChooserLauncher.launch(intent)
+                } catch (e: Exception) {
+                    fileUploadCallback?.onReceiveValue(null)
+                    fileUploadCallback = null
+                    return false
+                }
+                return true
+            }
+
+            override fun onProgressChanged(view: WebView?, newProgress: Int) {
+                super.onProgressChanged(view, newProgress)
+                if (loadingBarEnabled) {
+                    progressBar?.progress = newProgress
+                }
+                if (newProgress == 100) {
+                    swipeRefreshLayout.isRefreshing = false
+                    if (loadingBarEnabled) progressBar?.visibility = View.GONE
+                }
+            }
+        }
+
+        // File download support
+        if (fileDownloadEnabled) {
+            webView.setDownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
+                try {
+                    val request = DownloadManager.Request(Uri.parse(url))
+                    request.setMimeType(mimeType)
+                    request.addRequestHeader("User-Agent", userAgent)
+                    request.setDescription("Downloading file...")
+                    request.setTitle(URLUtil.guessFileName(url, contentDisposition, mimeType))
+                    request.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                    request.setDestinationInExternalPublicDir(
+                        Environment.DIRECTORY_DOWNLOADS,
+                        URLUtil.guessFileName(url, contentDisposition, mimeType)
+                    )
+                    val dm = getSystemService(DOWNLOAD_SERVICE) as DownloadManager
+                    dm.enqueue(request)
+                    Toast.makeText(this, "Downloading...", Toast.LENGTH_SHORT).show()
+                } catch (e: Exception) {
+                    Toast.makeText(this, "Download failed", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+
+    private fun animateSplashLogo() {
+        splashLogo.scaleX = 0f
+        splashLogo.scaleY = 0f
+        splashLogo.alpha = 0f
+        splashOverlay.visibility = View.VISIBLE
+
+        val scaleXUp = ObjectAnimator.ofFloat(splashLogo, "scaleX", 0f, 1.1f, 1f).apply {
+            duration = 800
+            interpolator = OvershootInterpolator(1.5f)
+        }
+        val scaleYUp = ObjectAnimator.ofFloat(splashLogo, "scaleY", 0f, 1.1f, 1f).apply {
+            duration = 800
+            interpolator = OvershootInterpolator(1.5f)
+        }
+        val fadeIn = ObjectAnimator.ofFloat(splashLogo, "alpha", 0f, 1f).apply {
+            duration = 500
+        }
+
+        val enterSet = AnimatorSet().apply {
+            playTogether(scaleXUp, scaleYUp, fadeIn)
+        }
+
+        val pulseXUp = ObjectAnimator.ofFloat(splashLogo, "scaleX", 1f, 1.08f, 1f).apply {
+            duration = 600
+            interpolator = AccelerateDecelerateInterpolator()
+        }
+        val pulseYUp = ObjectAnimator.ofFloat(splashLogo, "scaleY", 1f, 1.08f, 1f).apply {
+            duration = 600
+            interpolator = AccelerateDecelerateInterpolator()
+        }
+
+        val pulseSet = AnimatorSet().apply {
+            playTogether(pulseXUp, pulseYUp)
+        }
+
+        val scaleXOut = ObjectAnimator.ofFloat(splashLogo, "scaleX", 1f, 1.2f).apply { duration = 400 }
+        val scaleYOut = ObjectAnimator.ofFloat(splashLogo, "scaleY", 1f, 1.2f).apply { duration = 400 }
+        val fadeOut = ObjectAnimator.ofFloat(splashLogo, "alpha", 1f, 0f).apply { duration = 400 }
+        val overlayFade = ObjectAnimator.ofFloat(splashOverlay, "alpha", 1f, 0f).apply { duration = 400 }
+
+        val exitSet = AnimatorSet().apply {
+            playTogether(scaleXOut, scaleYOut, fadeOut, overlayFade)
+        }
+
+        AnimatorSet().apply {
+            playSequentially(enterSet, pulseSet, exitSet)
+            addListener(object : android.animation.AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: android.animation.Animator) {
+                    splashOverlay.visibility = View.GONE
+                }
+            })
+        }.start()
+    }
+
+    @Deprecated("Use OnBackPressedCallback instead")
+    override fun onBackPressed() {
+        if (webView.canGoBack()) {
+            webView.goBack()
+        } else {
+            @Suppress("DEPRECATION")
+            super.onBackPressed()
+        }
+    }
+}
