@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="primary">{{COLOR_PRIMARY}}</color>
+    <color name="primary_dark">{{COLOR_PRIMARY_DARK}}</color>
+    <color name="accent">{{COLOR_ACCENT}}</color>
+    <color name="white">#FFFFFF</color>
+    <color name="splash_bg">{{COLOR_SPLASH_BG}}</color>
+</resources>
